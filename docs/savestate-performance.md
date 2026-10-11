@@ -102,12 +102,54 @@ Raw measurements, logs, original executables and disposable runtime data remain
 under the ignored local `build-arm64/savestate-results/` directory. Game states,
 firmware and local configuration are not repository artifacts.
 
+## Reusing native SPU objects within a session
+
+The SPU disk cache stores guest programs, which were translated and compiled
+again after every reset. On ARM64, successful LLVM objects can now be retained
+in a process-local cache. Its SHA-256 key covers the complete generated bitcode,
+CPU, target features, code model, relocation model and optimization level.
+Changed IR or target settings cause a miss. Objects are immutable, copied into
+the new execution engine and relocated again; live code, patched branch
+trampolines and dispatcher tables are not retained. The cache has a 128 MiB
+object-data limit and a 65,536-entry limit, with FIFO eviction. Closing RPCS3
+discards it. The existing SPU Cache option controls its use; debug builds keep
+their diagnostic cache path.
+
+Generating and finalizing an object now share one LLVM recovery thread on the
+normal ARM64 path. Module verification remains enabled, while large IR and
+disassembly strings are generated only for diagnostics that will be used.
+The existing TBL2 retry and SPU capture safety checks remain in place.
+
+FIFA 10 was restored from the same private state twice using the same executable
+and configuration, first with a cold native-object cache and then in the same
+process with that cache warm:
+
+| Measurement | Cold native cache | Warm native cache |
+| --- | ---: | ---: |
+| SPU cache initialization | 10.708 s | 1.597 s |
+| Native cache hits / misses | 7 / 13,333 | 13,338 / 3 |
+| Savestate information to automatic first-frame pause | 19.316 s | 9.493 s |
+
+About 39.6 MiB of object data was retained. After the warm restore, the expected
+Cruzeiro versus Atletico Mineiro 0-0 scene at 2:10 was visible, the keyboard
+resumed the match, and the clock advanced to 5:35. A further capture completed
+in 1.177 s and its automatic restore reached the pause in 11.546 s, including
+2.657 s of SPU cache initialization (13,353 hits / 1 miss). These are native
+observations for one title, not statistical guarantees for other workloads.
+
+The cache interface follows LLVM's [MCJIT object-cache flow](https://llvm.org/docs/MCJITDesignAndImplementation.html).
+Additional graphics-preload experiments were discarded after a measured
+regression. The Vulkan loading behavior is unchanged in this iteration.
+
 ## Validation and remaining work
 
-The ARM64 application and test executable build successfully. All **217 enabled
+The ARM64 application and test executable build successfully. All **223 enabled
 unit tests** pass. Eight serialization tests cover roundtrip boundaries, reader
 finalization, malformed magic, legacy concatenated frames, truncated headers and
-trailers, checksum corruption, clean EOF/empty frames, and peek overflow.
+trailers, checksum corruption, clean EOF/empty frames, and peek overflow. Six
+native-object tests execute compiled functions and cover reuse after a JIT
+reset, changed IR, changed target, external-symbol relinking, disabling the
+cache, and concurrent immutable-object reuse.
 
 Checksum failures are detected when the decoder reaches the affected frame data
 or trailer. A small prefix read cannot certify the integrity of an unread tail.
@@ -115,8 +157,10 @@ This work does not prove arbitrary malformed guest-object deserialization safe,
 cross-build guest compatibility beyond the tested baseline, deterministic gameplay
 replay, or stability across other titles.
 
-The overall optimization goal remains open. The next loops must measure full
-capture stages and tackle renderer preparation/recreation during restoration.
+The overall optimization goal remains open: the user wants save/load to feel
+near-instant, comparable to SNES/Genesis emulators. A 9-12 second warm load is
+still far from that target. The next loops must reduce the remaining preparation
+and state-reconstruction costs, and the cold load still compiles missing SPUs.
 `Savestate phase` log entries now report elapsed time between existing capture
 progress stages. One instrumented capture spent 1.034 s saving HDD1, 0.244 s
 saving VM memory, 0.002 s collecting/writing the header and 0.010 s finalizing

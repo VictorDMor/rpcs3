@@ -11,6 +11,7 @@
 #include "Crypto/sha1.h"
 #include "Utilities/StrUtil.h"
 #include "Utilities/JIT.h"
+#include "Emu/Cell/timers.hpp"
 #include "util/init_mutex.hpp"
 #include "util/shared_ptr.hpp"
 
@@ -839,6 +840,10 @@ void spu_cache::add(const spu_program& func)
 void spu_cache::initialize(bool build_existing_cache)
 {
 	jit_write_guard jit_guard;
+	const u64 cache_start = get_system_time();
+#ifdef LLVM_AVAILABLE
+	const auto native_cache_start = jit_compiler::get_object_cache_stats();
+#endif
 
 	spu_runtime::g_interpreter = spu_runtime::g_gateway;
 
@@ -880,6 +885,7 @@ void spu_cache::initialize(bool build_existing_cache)
 
 	// Read cache
 	auto func_list = cache.get();
+	const u64 cache_read_end = get_system_time();
 	atomic_t<usz> fnext{};
 	atomic_t<u8> fail_flag{0};
 
@@ -934,6 +940,7 @@ void spu_cache::initialize(bool build_existing_cache)
 		}
 	}
 
+	const u64 interpreter_end = get_system_time();
 	u32 worker_count = 0;
 
 	std::optional<scoped_progress_dialog> progress_dialog;
@@ -1312,6 +1319,16 @@ void spu_cache::initialize(bool build_existing_cache)
 	}
 
 	spu_log.notice("SPU Runtime: Workers built %u programs.", built_total);
+	spu_log.notice("SPU cache timing: read=%gs, interpreter=%gs, workers=%gs, total=%gs.",
+		(cache_read_end - cache_start) / 1000000.0,
+		(interpreter_end - cache_read_end) / 1000000.0,
+		(get_system_time() - interpreter_end) / 1000000.0,
+		(get_system_time() - cache_start) / 1000000.0);
+#ifdef LLVM_AVAILABLE
+	const auto native_cache_end = jit_compiler::get_object_cache_stats();
+	spu_log.notice("SPU native object cache: hits=%u, misses=%u, retained=%u bytes.",
+		native_cache_end.hits - native_cache_start.hits, native_cache_end.misses - native_cache_start.misses, native_cache_end.bytes);
+#endif
 
 	if (Emu.IsStopped())
 	{

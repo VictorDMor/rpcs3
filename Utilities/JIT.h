@@ -573,6 +573,19 @@ public:
 	// Returns false after LLVM fatal recovery. The compiler must be discarded.
 	bool try_add(std::unique_ptr<llvm::Module> _module, std::string& error);
 
+	// Generate and finalize in one recovery scope. Optional bounded process-local
+	// object caching uses the complete IR and target settings, never live JIT code.
+	bool try_compile(std::unique_ptr<llvm::Module> module, bool cache, std::string& error);
+
+	struct object_cache_stats
+	{
+		u64 hits;
+		u64 misses;
+		usz bytes;
+	};
+
+	static object_cache_stats get_object_cache_stats();
+
 	// Add object (path to obj file)
 	bool add(const std::string& path);
 

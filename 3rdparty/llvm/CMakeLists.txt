@@ -97,6 +97,7 @@ if(WITH_LLVM)
 			${LLVM_TARGETS_TO_BUILD}
 			${LLVM_ADDITIONAL_LIBS}
 			Core
+			BitWriter
 			ExecutionEngine
 			MCJIT
 			Passes

@@ -1740,17 +1740,8 @@ public:
 
 		std::string function_log;
 
-		this->dump(func, function_log);
 		bool to_log_func = false;
-
-		if (g_cfg.core.spu_debug && !add_loc->logged.exchange(1))
-		{
-			if (!fs::write_file(m_spurt->get_cache_path() + "spu.log", fs::write + fs::append, function_log))
-			{
-				// Fallback: write to main log
-				to_log_func = true;
-			}
-		}
+		const bool log_debug_func = g_cfg.core.spu_debug && !add_loc->logged.exchange(1);
 
 		for (u32 data : func.data)
 		{
@@ -1762,6 +1753,17 @@ public:
 			{
 				to_log_func = true;
 			}
+		}
+
+		if (to_log_func || g_cfg.core.spu_debug)
+		{
+			this->dump(func, function_log);
+		}
+
+		if (log_debug_func && !fs::write_file(m_spurt->get_cache_path() + "spu.log", fs::write + fs::append, function_log))
+		{
+			// Fallback: write to main log
+			to_log_func = true;
 		}
 
 		if (to_log_func)
@@ -3898,12 +3900,19 @@ public:
 		std::string& llvm_log = function_log;
 		raw_string_ostream out(llvm_log);
 
-		fmt::append(llvm_log, "LLVM IR at 0x%x:\n", func.entry_point);
-		out << *_module; // print IR
-		out << "\n\n";
+		if (g_cfg.core.spu_debug)
+		{
+			fmt::append(llvm_log, "LLVM IR at 0x%x:\n", func.entry_point);
+			out << *_module;
+			out << "\n\n";
+		}
 
 		if (verifyModule(*_module, &out))
 		{
+			if (!g_cfg.core.spu_debug)
+			{
+				out << *_module;
+			}
 			out.flush();
 			spu_log.error("LLVM: Verification failed at 0x%x:\n%s", func.entry_point, llvm_log);
 
@@ -3952,13 +3961,14 @@ public:
 				{
 					// Testing only
 					added = m_jit.try_add(std::move(_module), m_spurt->get_cache_path() + "llvm/", llvm_error);
+					added = added && m_jit.try_fin(llvm_error);
 				}
 				else
 				{
-					added = m_jit.try_add(std::move(_module), llvm_error);
+					added = m_jit.try_compile(std::move(_module), g_cfg.core.spu_cache.get(), llvm_error);
 				}
 
-				if (!added || !m_jit.try_fin(llvm_error))
+				if (!added)
 				{
 					if (add_to_file)
 					{
@@ -4421,12 +4431,19 @@ public:
 		std::string llvm_log;
 		raw_string_ostream out(llvm_log);
 
-		fmt::append(llvm_log, "LLVM IR (interpreter):\n");
-		out << *_module; // print IR
-		out << "\n\n";
+		if (g_cfg.core.spu_debug)
+		{
+			fmt::append(llvm_log, "LLVM IR (interpreter):\n");
+			out << *_module;
+			out << "\n\n";
+		}
 
 		if (verifyModule(*_module, &out))
 		{
+			if (!g_cfg.core.spu_debug)
+			{
+				out << *_module;
+			}
 			out.flush();
 			spu_log.error("LLVM: Verification failed:\n%s", llvm_log);
 
@@ -4438,17 +4455,31 @@ public:
 			fmt::throw_exception("Compilation failed");
 		}
 
-		if (g_cfg.core.spu_debug)
+#ifdef ARCH_ARM64
+		if (!g_cfg.core.spu_debug)
 		{
-			// Testing only
-			m_jit.add(std::move(_module), m_spurt->get_cache_path() + "llvm/");
+			std::string error;
+			if (!m_jit.try_compile(std::move(_module), g_cfg.core.spu_cache.get(), error))
+			{
+				spu_log.error("LLVM failed to compile SPU interpreter: %s", error);
+				return nullptr;
+			}
 		}
 		else
+#endif
 		{
-			m_jit.add(std::move(_module));
-		}
+			if (g_cfg.core.spu_debug)
+			{
+				// Testing only
+				m_jit.add(std::move(_module), m_spurt->get_cache_path() + "llvm/");
+			}
+			else
+			{
+				m_jit.add(std::move(_module));
+			}
 
-		m_jit.fin();
+			m_jit.fin();
+		}
 
 		// Register interpreter entry point
 		spu_runtime::g_interpreter = reinterpret_cast<spu_function_t>(m_jit.get_engine().getPointerToFunction(main_func));

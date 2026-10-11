@@ -23,6 +23,9 @@ LOG_CHANNEL(jit_log, "JIT");
 #ifdef LLVM_AVAILABLE
 
 #include <unordered_map>
+#include <deque>
+#include <mutex>
+#include <optional>
 
 #ifdef _MSC_VER
 #pragma warning(push, 0)
@@ -46,6 +49,9 @@ LOG_CHANNEL(jit_log, "JIT");
 #include "llvm/ExecutionEngine/JITEventListener.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/SymbolSize.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Support/SHA256.h"
+#include "llvm/Target/TargetMachine.h"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #else
@@ -553,6 +559,111 @@ public:
 	}
 };
 
+namespace
+{
+	// Retain relocatable objects across emulator resets. JIT memory and dispatch
+	// tables are still rebuilt, so patched live code never enters this cache.
+	struct memory_object_cache_store
+	{
+		static constexpr usz max_bytes = 128 * 1024 * 1024;
+		static constexpr usz max_entries = 65536;
+		std::mutex mutex;
+		std::unordered_map<std::string, std::shared_ptr<const std::vector<char>>> objects;
+		std::deque<std::string> order;
+		usz bytes = 0;
+		u64 hits = 0;
+		u64 misses = 0;
+	};
+
+	memory_object_cache_store& get_memory_object_cache()
+	{
+		static memory_object_cache_store cache;
+		return cache;
+	}
+
+	class MemoryObjectCache final : public llvm::ObjectCache
+	{
+		const llvm::Module* const m_module;
+		std::string m_key;
+
+	public:
+		MemoryObjectCache(const llvm::Module& module, const llvm::TargetMachine& target)
+			: m_module(&module)
+		{
+			llvm::SmallVector<char, 4096> bitcode;
+			llvm::raw_svector_ostream stream(bitcode);
+			llvm::WriteBitcodeToFile(module, stream);
+			llvm::SHA256 hash;
+			hash.update(llvm::StringRef(bitcode.data(), bitcode.size()));
+			hash.update(fmt::format("/%s/%s/%u/%u/%u", target.getTargetCPU().str(), target.getTargetFeatureString().str(), static_cast<u32>(target.getCodeModel()),
+				static_cast<u32>(target.getRelocationModel()), static_cast<u32>(target.getOptLevel())));
+			const auto digest = hash.final();
+			m_key.assign(reinterpret_cast<const char*>(digest.data()), digest.size());
+		}
+
+		std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module* module) override
+		{
+			if (module != m_module)
+			{
+				return nullptr;
+			}
+
+			auto& cache = get_memory_object_cache();
+			std::shared_ptr<const std::vector<char>> object;
+			{
+				std::lock_guard lock(cache.mutex);
+				const auto it = cache.objects.find(m_key);
+				if (it == cache.objects.end())
+				{
+					cache.misses++;
+					return nullptr;
+				}
+				cache.hits++;
+				object = it->second;
+			}
+
+			return llvm::MemoryBuffer::getMemBufferCopy(llvm::StringRef(object->data(), object->size()));
+		}
+
+		void notifyObjectCompiled(const llvm::Module* module, llvm::MemoryBufferRef object) override
+		{
+			const usz size = object.getBufferSize();
+			if (module != m_module || !size || size > memory_object_cache_store::max_bytes)
+			{
+				return;
+			}
+
+			auto data = std::make_shared<const std::vector<char>>(object.getBufferStart(), object.getBufferEnd());
+			auto& cache = get_memory_object_cache();
+			std::lock_guard lock(cache.mutex);
+			if (cache.objects.contains(m_key))
+			{
+				return;
+			}
+
+			while (cache.bytes + size > memory_object_cache_store::max_bytes ||
+				cache.objects.size() >= memory_object_cache_store::max_entries)
+			{
+				auto it = cache.objects.find(cache.order.front());
+				cache.bytes -= it->second->size();
+				cache.objects.erase(it);
+				cache.order.pop_front();
+			}
+
+			cache.objects.emplace(m_key, std::move(data));
+			cache.order.push_back(m_key);
+			cache.bytes += size;
+		}
+	};
+}
+
+jit_compiler::object_cache_stats jit_compiler::get_object_cache_stats()
+{
+	auto& cache = get_memory_object_cache();
+	std::lock_guard lock(cache.mutex);
+	return {cache.hits, cache.misses, cache.bytes};
+}
+
 std::string jit_compiler::cpu(std::string_view _cpu)
 {
 	std::string m_cpu = std::string(_cpu);
@@ -900,6 +1011,34 @@ bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, std::string& e
 	}
 
 	return true;
+}
+
+bool jit_compiler::try_compile(std::unique_ptr<llvm::Module> module, bool cache, std::string& error)
+{
+	std::optional<MemoryObjectCache> object_cache;
+	if (cache)
+	{
+		object_cache.emplace(*module, *m_engine->getTargetMachine());
+	}
+
+	const auto ptr = module.get();
+	m_engine->setObjectCache(object_cache ? &*object_cache : nullptr);
+	m_engine->addModule(std::move(module));
+	const bool result = run_recoverable_llvm([&]()
+	{
+		m_engine->generateCodeForModule(ptr);
+		m_engine->finalizeObject();
+	}, error);
+	m_engine->setObjectCache(nullptr);
+
+	if (result)
+	{
+		for (auto& func : ptr->functions())
+		{
+			func.deleteBody();
+		}
+	}
+	return result;
 }
 
 bool jit_compiler::add(const std::string& path)

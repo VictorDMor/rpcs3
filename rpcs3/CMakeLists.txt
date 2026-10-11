@@ -189,6 +189,7 @@ if(BUILD_RPCS3_TESTS)
             tests/test_fmt.cpp
             tests/test_iso_open.cpp
             tests/test_iso_extent.cpp
+            tests/test_jit_object_cache.cpp
             tests/test_pair.cpp
             tests/test_rsx_cfg.cpp
             tests/test_rsx_fp_asm.cpp
