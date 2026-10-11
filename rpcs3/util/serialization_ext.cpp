@@ -781,66 +781,66 @@ usz compressed_serialization_file_handler::get_size(const utils::serial& ar, usz
 
 struct compressed_zstd_stream_data
 {
-	ZSTD_DCtx* m_zd{};
-	ZSTD_DStream* m_zs{};
-	lf_queue<std::vector<u8>> m_queued_data_to_process;
-	lf_queue<std::vector<u8>> m_queued_data_to_write;
+	const std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> compressor{ZSTD_createCCtx(), ZSTD_freeCCtx};
+	const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> decompressor{ZSTD_createDCtx(), ZSTD_freeDCtx};
 };
 
 void compressed_zstd_serialization_file_handler::initialize(utils::serial& ar)
 {
-	if (!m_stream)
+	if ((ar.is_writing() && m_write_inited) || (!ar.is_writing() && m_read_inited))
 	{
-		m_stream = std::make_shared<compressed_zstd_stream_data>();
+		return;
 	}
+
+	ensure(!m_write_inited && !m_read_inited);
+	m_stream = std::make_shared<compressed_zstd_stream_data>();
+	ensure(m_stream->compressor && m_stream->decompressor);
+	m_errored = false;
 
 	if (ar.is_writing())
 	{
-		if (m_write_inited)
-		{
-			return;
-		}
+		auto* context = m_stream->compressor.get();
+		// Fast lossless compression keeps capture latency low for guest RAM and
+		// game caches, which often contain already-compressed data.
+		ensure(!ZSTD_isError(ZSTD_CCtx_setParameter(context, ZSTD_c_compressionLevel, 1)));
+		ensure(!ZSTD_isError(ZSTD_CCtx_setParameter(context, ZSTD_c_checksumFlag, 1)));
 
-		if (m_read_inited && m_stream->m_zd)
+		// Zstd owns the bounded job queue and preserves one continuous dictionary.
+		// Limit workers instead of allocating a full 16 MiB frame per host thread.
+		const int workers = ar.expect_little_data() ? 0 : static_cast<int>(std::min<u32>(utils::get_thread_count() / 2, 4));
+		if (!ZSTD_isError(ZSTD_CCtx_setParameter(context, ZSTD_c_nbWorkers, workers)) && workers)
 		{
-			finalize(ar);
+			ensure(!ZSTD_isError(ZSTD_CCtx_setParameter(context, ZSTD_c_jobSize, 0x100000)));
 		}
-
+		m_output_buffer.resize(0x100000);
 		m_write_inited = true;
-		m_errored = false;
-
-		m_compression_threads.clear();
-		m_file_writer_thread.reset();
-
-		// Make sure at least one thread is free
-		// Limit thread count in order to make sure memory limits are under control (TODO: scale with RAM size)
-		const usz thread_count = std::min<u32>(std::max<u32>(utils::get_thread_count(), 2) - 1, 32);
-
-		for (usz i = 0; i < thread_count; i++)
-		{
-			m_compression_threads.emplace_back().m_thread = std::make_unique<named_thread<std::function<void()>>>(fmt::format("CompressedPrepare Thread %d", i + 1), [this]() { this->stream_data_prepare_thread_op(); });
-		}
-
-		m_file_writer_thread = std::make_unique<named_thread<std::function<void()>>>("CompressedWriter Thread"sv, [this]() { this->file_writer_thread_op(); });
 	}
 	else
 	{
-		if (m_read_inited)
-		{
-			return;
-		}
-
-		if (m_write_inited)
-		{
-			finalize(ar);
-		}
-
-		auto& m_zd = m_stream->m_zd;
-		m_zd = ZSTD_createDCtx();
-		m_stream->m_zs = ZSTD_createDStream();
+		m_decompression_result = 1;
 		m_read_inited = true;
-		m_errored = false;
 	}
+}
+
+bool compressed_zstd_serialization_file_handler::compress(utils::serial& ar, bool end)
+{
+	ZSTD_inBuffer input{ar.data.data(), ar.data.size(), 0};
+	usz remaining = 0;
+	do
+	{
+		ZSTD_outBuffer output{m_output_buffer.data(), m_output_buffer.size(), 0};
+		remaining = ZSTD_compressStream2(m_stream->compressor.get(), &output, &input, end ? ZSTD_e_end : ZSTD_e_continue);
+		if (ZSTD_isError(remaining) || m_file->write(m_output_buffer.data(), output.pos) != output.pos)
+		{
+			m_errored = true;
+			sys_log.error("Savestate compression or file write failed (zstd=%s).", ZSTD_getErrorName(remaining));
+			return false;
+		}
+	} while (input.pos < input.size || (end && remaining));
+
+	ar.data_offset += ar.data.size();
+	ar.data.clear();
+	return true;
 }
 
 bool compressed_zstd_serialization_file_handler::handle_file_op(utils::serial& ar, usz pos, usz size, const void* data)
@@ -874,29 +874,7 @@ bool compressed_zstd_serialization_file_handler::handle_file_op(utils::serial& a
 		}
 
 		ar.seek_end();
-
-		const usz buffer_idx = m_input_buffer_index++ % m_compression_threads.size();
-		auto& input = m_compression_threads[buffer_idx].m_input;
-
-		while (input)
-		{
-			// No waiting support on non-null pointer
-			thread_ctrl::wait_for(2'000);
-		}
-
-		input.store(stx::make_single_value(std::move(ar.data)));
-		input.notify_all();
-
-		ar.data_offset = ar.pos;
-		ar.data.clear();
-
-		if (pos == umax && size == umax && *m_file)
-		{
-			// Request to flush the file to disk
-			m_file->sync();
-		}
-
-		return true;
+		return compress(ar, false);
 	}
 
 	initialize(ar);
@@ -998,103 +976,56 @@ bool compressed_zstd_serialization_file_handler::handle_file_op(utils::serial& a
 		ar.data.resize(this->read_at(ar, old_size + ar.data_offset, data ? const_cast<void*>(data) : ar.data.data() + old_size, ar.data.size() - old_size) + old_size);
 	}
 
-	return true;
+	return !m_errored;
 }
 
 usz compressed_zstd_serialization_file_handler::read_at(utils::serial& ar, usz read_pos, void* data, usz size)
 {
 	ensure(read_pos == ar.data.size() + ar.data_offset - size);
-
-	if (!size || m_errored)
-	{
-		return 0;
-	}
-
-	initialize(ar);
-
-	auto& m_zd = m_stream->m_zd;
-
-	const usz total_to_read = size;
 	usz read_size = 0;
-	u8* out_data = static_cast<u8*>(data);
 
-	for (; read_size < total_to_read;)
+	while (read_size < size && !m_errored)
 	{
-		// Drain extracted memory stash (also before first file read)
-		out_data = static_cast<u8*>(data) + read_size;
-
-		auto avail_in = m_stream_data.size() - m_stream_data_index;
-		auto next_in = reinterpret_cast<const u8*>(m_stream_data.data() + m_stream_data_index);
-		auto next_out = out_data;
-		auto avail_out = size - read_size;
-
-		for (bool is_first = true; read_size < total_to_read && avail_in; is_first = false)
+		ZSTD_inBuffer input{m_stream_data.data(), m_stream_data.size(), m_stream_data_index};
+		ZSTD_outBuffer output{static_cast<u8*>(data) + read_size, size - read_size, 0};
+		const usz previous_input = input.pos;
+		if (input.pos < input.size || m_decompression_result)
 		{
-			bool need_more_file_memory = false;
-
-			ZSTD_outBuffer outs{next_out, avail_out, 0};
-
-			// Try to extract previously held data first
-			ZSTD_inBuffer ins{next_in, is_first ? 0 : avail_in, 0};
-
-			const usz res = ZSTD_decompressStream(m_zd, &outs, &ins);
-
-			if (ZSTD_isError(res))
-			{
-				need_more_file_memory = true;
-				// finalize(ar);
-				// m_errored = true;
-				// sys_log.error("Failure of compressed data reading. (res=%d, read_size=0x%x, avail_in=0x%x, avail_out=0x%x, ar=%s)", res, read_size, avail_in, avail_out, ar);
-				// return read_size;
-			}
-
-			read_size += outs.pos;
-			next_out += outs.pos;
-			avail_out -= outs.pos;
-			next_in += ins.pos;
-			avail_in -= ins.pos;
-
-			m_stream_data_index = next_in - m_stream_data.data();
-
-			if (need_more_file_memory)
-			{
-				break;
-			}
+			m_decompression_result = ZSTD_decompressStream(m_stream->decompressor.get(), &output, &input);
 		}
+		m_stream_data_index = input.pos;
+		read_size += output.pos;
 
-		if (read_size >= total_to_read)
+		if (ZSTD_isError(m_decompression_result))
 		{
+			m_errored = true;
+			sys_log.error("Savestate decompression failed: %s (offset=0x%x).", ZSTD_getErrorName(m_decompression_result), read_pos + read_size);
 			break;
 		}
 
-		const usz add_size = ar.expect_little_data() ? 0x1'0000 : 0x10'0000;
-		const usz old_file_buf_size = m_stream_data.size();
-
-		m_stream_data.resize(old_file_buf_size + add_size);
-		m_stream_data.resize(old_file_buf_size + m_file->read_at(m_file_read_index, m_stream_data.data() + old_file_buf_size, add_size));
-
-		if (m_stream_data.size() == old_file_buf_size)
+		if (output.pos || input.pos != previous_input)
 		{
-			// EOF
-			//ensure(read_size == total_to_read);
-			break;
+			continue;
 		}
 
-		m_file_read_index += m_stream_data.size() - old_file_buf_size;
-	}
-
-	if (m_stream_data.size() - m_stream_data_index <= m_stream_data_index / 5)
-	{
-		// Shrink to required memory size
-		m_stream_data.erase(m_stream_data.begin(), m_stream_data.begin() + m_stream_data_index);
-
-		if (m_stream_data.capacity() >= 0x200'0000)
-		{
-			// Discard memory
-			m_stream_data.shrink_to_fit();
-		}
-
+		// A decoder can have buffered output after consuming its last input byte.
+		// Refill only after a no-progress call, and never retry after an error.
+		ensure(m_stream_data_index == m_stream_data.size());
+		m_stream_data.resize(ar.expect_little_data() ? 0x10000 : 0x100000);
+		const usz count = m_file->read_at(m_file_read_index, m_stream_data.data(), m_stream_data.size());
+		m_file_read_index += count;
+		m_stream_data.resize(count);
 		m_stream_data_index = 0;
+
+		if (!count)
+		{
+			if (m_decompression_result)
+			{
+				m_errored = true;
+				sys_log.error("Savestate compressed frame is truncated (offset=0x%x).", read_pos + read_size);
+			}
+			break;
+		}
 	}
 
 	return read_size;
@@ -1112,180 +1043,23 @@ void compressed_zstd_serialization_file_handler::skip_until(utils::serial& ar)
 
 void compressed_zstd_serialization_file_handler::finalize(utils::serial& ar)
 {
-	handle_file_op(ar, 0, umax, nullptr);
-
-	if (!m_stream)
+	if (ar.is_writing())
 	{
-		return;
+		initialize(ar);
+		ensure(ar.pos == ar.data_offset + ar.data.size());
+		ensure(!m_errored && compress(ar, true));
+		m_file->sync();
 	}
 
-	auto& m_zd = m_stream->m_zd;
-
-	if (m_read_inited)
-	{
-		//ZSTD_decompressEnd(m_stream->m_zd);
-		ensure(ZSTD_freeDCtx(m_zd));
-		m_read_inited = false;
-		return;
-	}
-
-	const stx::shared_ptr<std::vector<u8>> empty_data = stx::make_single<std::vector<u8>>();
-	const stx::shared_ptr<std::vector<u8>> null_ptr = stx::null_ptr;
-
-	for (bool has_pending_threads = true; has_pending_threads; thread_ctrl::wait_for(500))
-	{
-		has_pending_threads = false;
-
-		// Try to notify all in bulk
-		for (auto& context : m_compression_threads)
-		{
-			if (!context.notified && !context.m_input && context.m_input.compare_and_swap_test(null_ptr, empty_data))
-			{
-				context.notify_pending = true;
-			}
-		}
-
-		for (auto& context : m_compression_threads)
-		{
-			if (context.notify_pending)
-			{
-				context.notified = true;
-				context.notify_pending = false;
-				context.m_input.notify_all();
-			}
-		}
-
-		for (auto& context : m_compression_threads)
-		{
-			// Wait for notification to be sent and received
-			// And wait for data to be written to be read by the thread
-			if (!context.notified || context.m_input || context.m_output)
-			{
-				has_pending_threads = true;
-			}
-		}
-	}
-
-	for (usz idx = m_output_buffer_index;;)
-	{
-		auto& out_cur = m_compression_threads[idx % m_compression_threads.size()].m_output;
-		auto& out_next = m_compression_threads[(idx + 1) % m_compression_threads.size()].m_output;
-
-		out_cur.compare_and_swap_test(null_ptr, empty_data);
-		out_next.compare_and_swap_test(null_ptr, empty_data);
-
-		if (usz new_val = m_output_buffer_index; idx != new_val)
-		{
-			// Index was changed inbetween, retry on the next index
-			idx = new_val;
-			continue;
-		}
-
-		// Must be waiting on either of the two
-		out_cur.notify_all();
-
-		// Check for single thread
-		if (&out_next != &out_cur)
-		{
-			out_next.notify_all();
-		}
-
-		break;
-	}
-
-	if (m_file_writer_thread)
-	{
-		// Join here to avoid log messages in the destructor
-		(*m_file_writer_thread)();
-	}
-
-	m_compression_threads.clear();
-	m_file_writer_thread.reset();
-
+	// Releasing the context also joins Zstd's workers, including on early exit.
+	m_stream.reset();
 	m_stream_data = {};
+	m_stream_data_index = 0;
+	m_file_read_index = 0;
+	m_output_buffer = {};
 	m_write_inited = false;
-	ar.data = {}; // Deallocate and clear
-
-	m_file->sync();
-}
-
-void compressed_zstd_serialization_file_handler::stream_data_prepare_thread_op()
-{
-	ZSTD_CCtx* m_zc = ZSTD_createCCtx();
-
-	std::vector<u8> stream_data;
-
-	const stx::shared_ptr<std::vector<u8>> null_ptr = stx::null_ptr;
-	const usz thread_index = m_thread_buffer_index++;
-
-	while (true)
-	{
-		auto& input = m_compression_threads[thread_index].m_input;
-		auto& output = m_compression_threads[thread_index].m_output;
-
-		while (!input)
-		{
-			input.wait(nullptr);
-		}
-
-		auto data = input.exchange(stx::null_ptr);
-		input.notify_all();
-
-		if (data->empty())
-		{
-			// Abort is requested, flush data and exit
-			break;
-		}
-
-		stream_data.resize(::ZSTD_compressBound(data->size()));
-		const usz out_size = ZSTD_compressCCtx(m_zc, stream_data.data(), stream_data.size(), data->data(), data->size(), ZSTD_btultra);
-
-		ensure(!ZSTD_isError(out_size) && out_size);
-
-		if (m_errored)
-		{
-			break;
-		}
-
-		stream_data.resize(out_size);
-
-		const stx::shared_ptr<std::vector<u8>> data_ptr = make_single<std::vector<u8>>(std::move(stream_data));
-
-		while (output || !output.compare_and_swap_test(null_ptr, data_ptr))
-		{
-			thread_ctrl::wait_for(1000);
-		}
-
-		//if (m_output_buffer_index % m_compression_threads.size() == thread_index)
-		{
-			output.notify_all();
-		}
-	}
-
-	ZSTD_freeCCtx(m_zc);
-}
-
-void compressed_zstd_serialization_file_handler::file_writer_thread_op()
-{
-	for (m_output_buffer_index = 0;; m_output_buffer_index++)
-	{
-		auto& output = m_compression_threads[m_output_buffer_index % m_compression_threads.size()].m_output;
-
-		while (!output)
-		{
-			output.wait(nullptr);
-		}
-
-		auto data = output.exchange(stx::null_ptr);
-		output.notify_all();
-
-		if (data->empty())
-		{
-			break;
-		}
-
-		m_file->write(*data);
-	}
+	m_read_inited = false;
+	ar.data = {};
 }
 
 usz compressed_zstd_serialization_file_handler::get_size(const utils::serial& ar, usz recommended) const

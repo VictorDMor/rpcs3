@@ -136,6 +136,10 @@ public:
 		template <typename Func> requires (std::is_convertible_v<std::invoke_result_t<Func>, const void*>)
 		bool raw_serialize(Func&& memory_provider, usz size)
 		{
+			if (!is_valid())
+			{
+				return false;
+			}
 			if (!size)
 			{
 				return true;
@@ -174,8 +178,11 @@ public:
 			{
 				// Load from file
 				ensure(m_file_handler);
-				ensure(m_file_handler->handle_file_op(*this, pos, size, nullptr));
-				ensure(!data.empty() && pos >= data_offset && pos + (size - 1) <= (data.size() - 1) + data_offset);
+				if (!m_file_handler->handle_file_op(*this, pos, size, nullptr)
+					|| data.empty() || pos < data_offset || pos + (size - 1) > (data.size() - 1) + data_offset)
+				{
+					return false;
+				}
 			}
 
 			std::memcpy(const_cast<void*>(static_cast<const void*>(memory_provider())), data.data() + (pos - data_offset), size);
@@ -662,13 +669,17 @@ public:
 				return 0;
 			}
 
-			const usz end_pos = pos + predict_object_size(std::forward<T>(obj));
+			const usz object_size = predict_object_size(std::forward<T>(obj));
+			if (object_size > ~usz{0} - pos)
+			{
+				return object_size;
+			}
+			const usz end_pos = pos + object_size;
 			const usz size = get_size(end_pos);
 
 			if (size >= end_pos)
 			{
-				serialize(std::forward<T>(obj));
-				return 0;
+				return serialize(std::forward<T>(obj)) ? 0 : predict_object_size(obj);
 			}
 
 			return end_pos - size;
@@ -682,13 +693,20 @@ public:
 				return {};
 			}
 
+			if (sizeof(T) > ~usz{0} - pos)
+			{
+				return {};
+			}
 			const usz end_pos = pos + sizeof(T);
 			const usz size = get_size(end_pos);
-			using type = std::remove_const_t<T>;
 
 			if (size >= end_pos)
 			{
-				return {true, this->operator type()};
+				std::remove_const_t<T> value{};
+				if (serialize(value))
+				{
+					return {true, value};
+				}
 			}
 
 			return {};
@@ -713,8 +731,7 @@ public:
 		// Used when an invalid state is encountered somewhere in a place we can't check success code such as constructor)
 		bool is_valid() const
 		{
-			// TODO
-			return true;
+			return pos != umax && (!m_file_handler || m_file_handler->is_valid());
 		}
 	};
 }

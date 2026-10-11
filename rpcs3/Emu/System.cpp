@@ -3804,8 +3804,21 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 			}
 		}
 
+		u64 phase_start = get_system_time();
+		std::string phase_name;
+		auto log_save_phase = [&]()
+		{
+			if (!phase_name.empty())
+			{
+				sys_log.notice("Savestate phase '%s': %gs", phase_name, (get_system_time() - phase_start) / 1000000.);
+				phase_name.clear();
+			}
+		};
 		auto set_progress_message = [&](std::string_view text)
 		{
+			log_save_phase();
+			phase_start = get_system_time();
+			phase_name = text;
 			*verbose_message = stx::make_single<std::string>(text);
 		};
 
@@ -4080,6 +4093,7 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 				clean_savestates(m_title_id, m_path, max_files, max_files_size_mb << 20);
 			}
 		}
+		log_save_phase();
 
 		// Log additional debug information - do not do it on the main thread due to the concern of halting UI events
 

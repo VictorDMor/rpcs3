@@ -196,6 +196,7 @@ if(BUILD_RPCS3_TESTS)
             tests/test_simple_array.cpp
             tests/test_spu_analyser.cpp
             tests/test_sys_fs.cpp
+            tests/test_serialization.cpp
             tests/test_tuple.cpp
             tests/test_types_util.cpp
     )
@@ -206,6 +207,7 @@ if(BUILD_RPCS3_TESTS)
             rpcs3_emu
             GTest::gtest
             GTest::gmock
+            3rdparty::zstd
     )
 
     target_include_directories(rpcs3_test

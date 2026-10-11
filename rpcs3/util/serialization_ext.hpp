@@ -167,27 +167,13 @@ private:
 	bool m_read_inited = false;
 	atomic_t<bool> m_errored = false;
 
-	usz m_input_buffer_index = 0;
-	atomic_t<usz> m_output_buffer_index = 0;
-	atomic_t<usz> m_thread_buffer_index = 0;
-
-	struct compression_thread_context_t
-	{
-		atomic_ptr<std::vector<u8>> m_input;
-		atomic_ptr<std::vector<u8>> m_output;
-		bool notify_pending = false;
-		bool notified = false;
-		std::unique_ptr<named_thread<std::function<void()>>> m_thread;
-	};
-
-	std::deque<compression_thread_context_t> m_compression_threads;
 	std::shared_ptr<compressed_zstd_stream_data> m_stream;
-	std::unique_ptr<named_thread<std::function<void()>>> m_file_writer_thread;
+	std::vector<u8> m_output_buffer;
+	usz m_decompression_result = 1;
 
 	usz read_at(utils::serial& ar, usz read_pos, void* data, usz size);
 	void initialize(utils::serial& ar);
-	void stream_data_prepare_thread_op();
-	void file_writer_thread_op();
+	bool compress(utils::serial& ar, bool end);
 };
 
 template <typename File> requires (std::is_same_v<std::remove_cvref_t<File>, fs::file>)
