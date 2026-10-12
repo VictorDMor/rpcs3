@@ -837,7 +837,7 @@ void spu_cache::add(const spu_program& func)
 	m_file.write_gather(gather, 3);
 }
 
-void spu_cache::initialize(bool build_existing_cache)
+void spu_cache::initialize(bool build_existing_cache, bool report_progress)
 {
 	jit_write_guard jit_guard;
 	const u64 cache_start = get_system_time();
@@ -962,7 +962,7 @@ void spu_cache::initialize(bool build_existing_cache)
 	atomic_t<u32> pending_progress = 0;
 	atomic_t<bool> showing_progress = false;
 
-	if (!g_progr_ptotal)
+	if (report_progress && !g_progr_ptotal)
 	{
 		g_progr_ptotal += total_funcs;
 		showing_progress.release(true);
@@ -1105,7 +1105,7 @@ void spu_cache::initialize(bool build_existing_cache)
 
 			result++;
 
-			if (is_first_thread && !showing_progress)
+			if (report_progress && is_first_thread && !showing_progress)
 			{
 				if (!g_progr_text && !g_progr_ptotal && !g_progr_ftotal)
 				{
@@ -1282,7 +1282,7 @@ void spu_cache::initialize(bool build_existing_cache)
 				block_addr = new_entry;
 			}
 
-			if (is_first_thread && !showing_progress)
+			if (report_progress && is_first_thread && !showing_progress)
 			{
 				if (!g_progr_text && !g_progr_ptotal && !g_progr_ftotal)
 				{

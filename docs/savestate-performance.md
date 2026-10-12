@@ -175,6 +175,47 @@ to exit and replace the file through a fresh temporary inode and rename. One
 in-place replacement was terminated by Taskgated with `Code Signature Invalid`
 before emulation began; atomic replacement resolved the launch failure.
 
+## Overlapping complete SPU preparation with PPU linking
+
+ARM64 savestate restores with both LLVM decoders, SPU caching enabled and SPU
+debugging disabled start an owned SPU preparation thread once PPU module
+registration and SPU data collection have finished. The complete SPU cache is
+built while PPU modules are compiled/linked. The initializing PPU joins that
+thread before guest time restoration, SPU release or the scheduler-ready gate.
+Early stop also joins it before the restored objects can be destroyed.
+
+The parallel SPU phase leaves the shared progress counters to the PPU phase;
+a waiting dialog covers any remaining SPU work. Normal boot, other decoder
+settings and SPU debugging keep serial initialization. For a developer comparison,
+`RPCS3_SAVESTATE_SERIAL_INIT=1` forces serial preparation on an eligible restore.
+
+A paired local comparison used the same private FIFA 10 state and configuration,
+with no concurrent build or test execution. Values are individual observations,
+not medians or a cross-game performance claim:
+
+| Logged interval | Serial preparation (`8a40dbfc4`) | Parallel preparation |
+| --- | ---: | ---: |
+| State information to initial pause, process cold | 19.054 s | 15.983 s |
+| State information to initial pause, same process warm | 8.983 s | 7.780 s |
+| Resume to first guest flip, cold restore | 18.545 ms | 28.809 ms |
+| Resume to first guest flip, warm restore | 20.629 ms | 26.267 ms |
+
+All four subsequent 1,000-flip samples stayed below 50 ms. In the parallel warm
+restore, SPU preparation took 2.457 s under contention but finished before PPU
+initialization; the final SPU join added approximately 1 microsecond. This improves
+wall-clock load time by overlapping existing work rather than deferring it into
+play. Both versions restored the expected 0-0 match at 2:10, resumed gameplay and
+stopped cleanly during these short tests.
+
+A new capture with the parallel candidate completed in 1.439 s; its automatic
+reload reached the initial pause in 8.726 s. The restored scene showed 0-0 at
+6:26 and resumed to 6:37. Capture time varies with the scene and HDD1 payload;
+this observation establishes no additional save-speed gain from parallel loading.
+A cold restore was also stopped during parallel preparation, after workers had
+built 5,452 programs. They logged cancellation, joined, and the emulator cleared
+restored objects without reaching the initial guest pause. Raw phase timings and
+comparisons are retained in the ignored results directory.
+
 ## Validation and remaining work
 
 The ARM64 application and test executable build successfully. All **223 enabled
@@ -189,10 +230,12 @@ Checksum failures are detected when the decoder reaches the affected frame data
 or trailer. A small prefix read cannot certify the integrity of an unread tail.
 This work does not prove arbitrary malformed guest-object deserialization safe,
 cross-build guest compatibility beyond the tested baseline, deterministic gameplay
-replay, or stability across other titles.
+replay, or stability across other titles. One earlier multi-minute experimental
+session hung when stopping a single SPU; its log and stack sample are retained
+for investigation. Successful short-session stops do not resolve that case.
 
 The overall optimization goal remains open: the user wants save/load to feel
-near-instant, comparable to SNES/Genesis emulators. A 9-12 second warm load is
+near-instant, comparable to SNES/Genesis emulators. A roughly 8-12 second warm load is
 still far from that target. The next loops must reduce the remaining preparation
 and state-reconstruction costs, and the cold load still compiles missing SPUs.
 `Savestate phase` log entries now report elapsed time between existing capture

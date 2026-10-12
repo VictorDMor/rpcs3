@@ -36,7 +36,7 @@ public:
 
 	void add(const struct spu_program& func);
 
-	static void initialize(bool build_existing_cache = true);
+	static void initialize(bool build_existing_cache = true, bool report_progress = true);
 
 	struct precompile_data_t
 	{

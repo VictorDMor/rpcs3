@@ -54,6 +54,7 @@
 #endif
 
 #include <cfenv>
+#include <cstdlib>
 #include <span>
 #include <optional>
 #include <charconv>
@@ -168,7 +169,7 @@ bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_b
 	return true;
 }
 
-extern void ppu_initialize();
+extern void ppu_initialize(const std::function<void()>& on_modules_ready);
 extern void ppu_finalize(const ppu_module<lv2_obj>& info, bool force_mem_release = false);
 extern bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only = false, u64 file_size = 0);
 static void ppu_initialize2(class jit_compiler& jit, const ppu_module<lv2_obj>& module_part, const std::string& cache_path, const std::string& obj_name);
@@ -2608,14 +2609,51 @@ void ppu_thread::cpu_task()
 		{
 			cmd_pop();
 
-			ppu_initialize();
+			std::unique_ptr<named_thread<std::function<void()>>> spu_preloader;
+			const bool restoring_state = Emu.DeserialManager() != nullptr;
+			const u64 ppu_init_start = get_system_time();
+			ppu_initialize([&]()
+			{
+#ifdef ARCH_ARM64
+				if (restoring_state && g_cfg.core.ppu_decoder == ppu_decoder_type::llvm &&
+					g_cfg.core.spu_decoder == spu_decoder_type::llvm && g_cfg.core.spu_cache &&
+					!g_cfg.core.spu_debug && !std::getenv("RPCS3_SAVESTATE_SERIAL_INIT"))
+				{
+					// Module registration and SPU data collection have finished. Build
+					// the complete cache during PPU linking, then join before guest execution.
+					spu_preloader.reset(new named_thread<std::function<void()>>("Savestate SPU preload", []()
+					{
+						spu_cache::initialize(true, false);
+					}));
+				}
+#endif
+			});
+			const u64 ppu_init_end = get_system_time();
+
+			if (spu_preloader)
+			{
+				scoped_progress_dialog progress(get_localized_string(localized_string_id::PROGRESS_DIALOG_BUILDING_SPU_CACHE));
+				(*spu_preloader)();
+				if (static_cast<thread_state>(*spu_preloader) != thread_state::finished)
+				{
+					fmt::throw_exception("Savestate SPU preloading failed");
+				}
+			}
+			else if (!Emu.IsStopped())
+			{
+				spu_cache::initialize();
+			}
+			if (restoring_state)
+			{
+				ppu_log.notice("Savestate initialization timing: PPU=%gs, SPU wait=%gs, overlapped=%u.",
+					(ppu_init_end - ppu_init_start) / 1000000.0,
+					(get_system_time() - ppu_init_end) / 1000000.0, static_cast<bool>(spu_preloader));
+			}
 
 			if (Emu.IsStopped())
 			{
 				return;
 			}
-
-			spu_cache::initialize();
 
 #ifdef ARCH_ARM64
 			// Flush all cache lines after potentially writing executable code
@@ -4746,7 +4784,7 @@ extern void ppu_precompile(std::vector<std::string>& dir_queue, std::vector<ppu_
 	exec_worker();
 }
 
-extern void ppu_initialize()
+extern void ppu_initialize(const std::function<void()>& on_modules_ready)
 {
 	if (!g_fxo->is_init<main_ppu_module<lv2_obj>>())
 	{
@@ -4868,6 +4906,9 @@ extern void ppu_initialize()
 	{
 		return;
 	}
+
+	// All modules and SPU data are registered before the compilation/linking pass.
+	on_modules_ready();
 
 	// Initialize main module cache
 	if (!_main.segs.empty())
