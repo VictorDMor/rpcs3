@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "RSXThread.h"
+#include <cstdlib>
 
 #include "Capture/rsx_capture.h"
 #include "Common/surface_store.h"
@@ -837,6 +838,7 @@ namespace rsx
 	thread::thread(utils::serial* _ar)
 		: cpu_thread(0x5555'5555)
 	{
+		m_savestate_frame_bench = _ar && std::getenv("RPCS3_SAVESTATE_FRAME_BENCH");
 		g_access_violation_handler = [this](u32 address, bool is_writing)
 		{
 			return on_access_violation(address, is_writing);
@@ -2750,6 +2752,29 @@ namespace rsx
 		if (info.emu_flip)
 		{
 			performance_counters.sampled_frames++;
+			if (m_savestate_frame_bench && !Emu.IsPaused() && !m_pause_after_x_flips)
+			{
+				const u64 active_time = get_system_time() - Emu.GetPauseTime();
+				if (m_savestate_frame_bench_previous)
+				{
+					m_savestate_frame_bench_intervals.push_back(active_time - m_savestate_frame_bench_previous);
+				}
+				else
+				{
+					rsx_log.notice("Savestate frame benchmark: first resumed guest frame.");
+				}
+				m_savestate_frame_bench_previous = active_time;
+				if (m_savestate_frame_bench_intervals.size() == 1000)
+				{
+					auto& intervals = m_savestate_frame_bench_intervals;
+					std::sort(intervals.begin(), intervals.end());
+					const auto over_50 = std::count_if(intervals.begin(), intervals.end(), [](u64 time) { return time > 50000; });
+					const auto over_100 = std::count_if(intervals.begin(), intervals.end(), [](u64 time) { return time > 100000; });
+					rsx_log.notice("Savestate frame benchmark: samples=1000, p50=%gms, p95=%gms, p99=%gms, max=%gms, over50=%u, over100=%u.",
+						intervals[500] / 1000.0, intervals[950] / 1000.0, intervals[990] / 1000.0, intervals.back() / 1000.0, over_50, over_100);
+					m_savestate_frame_bench = false;
+				}
+			}
 
 			if (m_pause_after_x_flips && m_pause_after_x_flips-- == 1)
 			{

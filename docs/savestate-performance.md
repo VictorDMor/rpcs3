@@ -141,6 +141,40 @@ The cache interface follows LLVM's [MCJIT object-cache flow](https://llvm.org/do
 Additional graphics-preload experiments were discarded after a measured
 regression. The Vulkan loading behavior is unchanged in this iteration.
 
+## Measuring the first usable frame
+
+Set `RPCS3_SAVESTATE_FRAME_BENCH=1` when launching a state to log the first
+unpaused guest flip, followed by statistics for 1,000 guest-flip intervals.
+Explicit emulator pause time is subtracted. The first flip has its own log
+marker and is excluded from the interval distribution; compare its timestamp
+with the `Emulation has been resumed!` message when testing `Start Paused`.
+These measure guest flips, not monitor scanout or deterministic input replay.
+Vulkan startup logs separately report interpreter and disk-shader-cache time.
+
+A deferred-SPU-compilation experiment made the cache ready in 83-89 ms and
+reached the initial pause in 7.5-8.2 s. It was rejected after a controlled
+comparison exposed the cost of the first resume:
+
+| Same private state and benchmark executable | Full prebuild | Deferred compilation |
+| --- | ---: | ---: |
+| First guest flip after Resume | 18.905 ms | 4,370.842 ms |
+| Subsequent 1,000 flip intervals above 50 ms | 0 | 0 |
+
+The initial-resume delay would be missed by looking only at the interval
+percentiles or the loading dialog. The production implementation keeps full
+SPU prebuilding and the validated native-object reuse. The experimental patch,
+duplicate-filter tests and raw logs remain in the ignored results directory.
+
+A separate driver-pipeline-cache experiment retained about 20.4 MiB across
+device recreation. Vulkan preparation measured 2.33 s cold and 2.06 s on the
+next restore, with a 12 ms snapshot step. This modest single-pair result did
+not justify keeping that additional cache in this iteration.
+
+When replacing a local macOS benchmark executable, wait for the prior process
+to exit and replace the file through a fresh temporary inode and rename. One
+in-place replacement was terminated by Taskgated with `Code Signature Invalid`
+before emulation began; atomic replacement resolved the launch failure.
+
 ## Validation and remaining work
 
 The ARM64 application and test executable build successfully. All **223 enabled

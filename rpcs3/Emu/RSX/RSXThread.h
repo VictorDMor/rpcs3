@@ -211,6 +211,9 @@ namespace rsx
 			u32 sampled_frames = 0;
 		}
 		performance_counters;
+		bool m_savestate_frame_bench = false;
+		u64 m_savestate_frame_bench_previous = 0;
+		std::vector<u64> m_savestate_frame_bench_intervals;
 
 		enum class flip_request : u32
 		{

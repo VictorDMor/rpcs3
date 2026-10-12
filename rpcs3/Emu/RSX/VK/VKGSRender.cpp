@@ -1255,6 +1255,7 @@ void VKGSRender::on_init_thread()
 
 	GSRender::on_init_thread();
 	zcull_ctrl.reset(static_cast<::rsx::reports::ZCULL_control*>(this));
+	const u64 graphics_init_start = get_system_time();
 
 	if (g_cfg.video.shadermode == shader_mode::async_with_interpreter ||
 		g_cfg.video.shadermode == shader_mode::interpreter_only)
@@ -1265,6 +1266,7 @@ void VKGSRender::on_init_thread()
 		m_shader_interpreter.preload(dlg.get());
 		dlg->close();
 	}
+	const u64 interpreter_preload_end = get_system_time();
 
 	if (g_cfg.video.shadermode != shader_mode::interpreter_only)
 	{
@@ -1282,6 +1284,11 @@ void VKGSRender::on_init_thread()
 			m_shaders_cache->load(&dlg);
 		}
 	}
+	const u64 shader_preload_end = get_system_time();
+	rsx_log.notice("Vulkan startup timing: interpreter=%gs, shader cache=%gs, total=%gs.",
+		(interpreter_preload_end - graphics_init_start) / 1000000.0,
+		(shader_preload_end - interpreter_preload_end) / 1000000.0,
+		(shader_preload_end - graphics_init_start) / 1000000.0);
 
 	// Now we properly initialize the pipe compiler as per the user's configuration
 	if (!g_cfg.video.shader_compiler_threads_count)
